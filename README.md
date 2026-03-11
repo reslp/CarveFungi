@@ -10,7 +10,7 @@ Requirements:
 - numpy
 - cobrapy
 - EggNog annotation software: https://github.com/eggnogdb/eggnog-mapper
-- Download the deep learning models from "https://zenodo.org/records/10725786" and copy them into the folder "/bin/compartmentPredictions/deepModels".
+- Download the deep learning models from " https://doi.org/10.5281/zenodo.18953301".
 
 
  CarveFungi uses a deep learning model to predict the cellular localization of the proteins and this information is used to score the reactions. 
