@@ -6,9 +6,9 @@
    
 '''
 import cobra
-import cplex
-from collections import Counter
+from pyscipopt import Model as SCIPModel, quicksum
 import operator
+import warnings
 
 
 class solution:
@@ -24,35 +24,35 @@ class solution:
     def get_obj(self):
         return self.obj
 
-def generate_soln_pool(solver):
-    cpx = solver
-    cpx.parameters.mip.pool.relgap.set(0.001)
-    # cpx.solve()
-    try:
-        cpx.populate_solution_pool()
-    except:
-        print("Exception raised during populate")
-        return []
-    numsol = cpx.solution.pool.get_num()
-    print("The solution pool contains %d solutions." % numsol)
+def generate_soln_pool(solver, relative_gap=0.001):
+    """Return stored SCIP solutions within 0.1% of the best incumbent score.
 
-    meanobjval = cpx.solution.pool.get_mean_objective_value()
-    print("The average objective value of the solutions is %.10g." %
-          meanobjval)
+    Unlike CPLEX's populate_solution_pool, this does not actively enumerate
+    alternatives. SCIP may retain only one qualifying solution.
+    """
+    solver.optimize()
+    status = str(solver.getStatus())
+    candidates = sorted(solver.getSols(), key=solver.getSolObjVal, reverse=True)
+    if not candidates:
+        raise RuntimeError(f"SCIP returned no feasible reconstruction (status: {status}).")
+    if status != "optimal":
+        warnings.warn(
+            f"SCIP status: {status}; using feasible incumbents, not proven optimal "
+            f"(MIP gap: {solver.getGap():.6g}).",
+            RuntimeWarning,
+        )
 
+    best = solver.getSolObjVal(candidates[0])
+    tolerance = relative_gap * abs(best) + 1e-9
+    variables = solver.getVars(transformed=False)
     sol_pool = []
-    for i in range(numsol):
-        objval_i = cpx.solution.pool.get_objective_value(i)
-        print("objective:",objval_i)
-        x_i = cpx.solution.pool.get_values(i)
-        print(x_i)
-        var_i = cpx.variables.get_names()
-        print(var_i)
-        sol = {}
-        for k in range(len(x_i)):
-            sol[var_i[k]]=(x_i[k])
-        sol_pool.append(solution(objval_i,sol))
+    for candidate in candidates:
+        objective = solver.getSolObjVal(candidate)
+        if best - objective <= tolerance:
+            values = {var.name: solver.getSolVal(candidate, var) for var in variables}
+            sol_pool.append(solution(objective, values))
 
+    print(f"SCIP status: {status}; retained {len(sol_pool)} solutions; best score: {best:.10g}")
     return sol_pool
 
 
@@ -74,21 +74,21 @@ def minmax_reduction(model, scores, min_growth=0.1, min_atpm=0.1, eps=1e-5, bigM
     Returns:
         Solution: optimization result
     """
-    problem = cplex.Cplex()
-    problem.parameters.simplex.tolerances.optimality = 1e-5
-    problem.parameters.simplex.tolerances.feasibility= 1e-6
-    #problem.parameters.mip.strategy.variableselect.set(3)
+    problem = SCIPModel("CarveFungi")
+    problem.setRealParam("numerics/dualfeastol", opti)
+    problem.setRealParam("numerics/feastol", feast)
+    problem.setMaximize()
 
     variables = {}
     for reaction in model.reactions:
-        variables[reaction.id] = problem.variables.add(obj=[0], names=[reaction.id], lb=[reaction.lower_bound],
-                                                       ub=[reaction.upper_bound])
-    A = cobra.util.array.create_stoichiometric_matrix(model, array_type="DataFrame")
-    names = A.index
-    A = A.transpose()
-    for name in names:
-        r = A[A[name] != 0]
-        problem.linear_constraints.add(lin_expr=[[r.index, r[name]]], senses=['E'], rhs=[0])
+        variables[reaction.id] = problem.addVar(
+            name=reaction.id, lb=reaction.lower_bound, ub=reaction.upper_bound)
+    for metabolite in model.metabolites:
+        balance = quicksum(
+            reaction.metabolites[metabolite] * variables[reaction.id]
+            for reaction in sorted(metabolite.reactions, key=lambda r: r.id)
+        )
+        problem.addCons(balance == 0, name="mass_" + metabolite.id)
 
     scores = scores.copy()
 
@@ -113,8 +113,8 @@ def minmax_reduction(model, scores, min_growth=0.1, min_atpm=0.1, eps=1e-5, bigM
                 scores[r_id] = ref_score
                 reactions.append(r_id)
 
-    problem.linear_constraints.add(lin_expr=[[['BIOMASS'], [1]]], senses=['G'], rhs=[min_growth], names =['min_growth'])
-    problem.linear_constraints.add(lin_expr=[[['UF01847_CE'], [1]]], senses=['G'], rhs=[min_atpm], names=['min_atpm'])
+    problem.addCons(variables['BIOMASS'] >= min_growth, name='min_growth')
+    problem.addCons(variables['UF01847_CE'] >= min_atpm, name='min_atpm')
 
     neg_vars = []
     pos_vars = []
@@ -123,40 +123,41 @@ def minmax_reduction(model, scores, min_growth=0.1, min_atpm=0.1, eps=1e-5, bigM
         rxn = model.reactions.get_by_id(r_id)
         if rxn.lower_bound < 0:
             y_r = 'yr_' + r_id
-            problem.variables.add(obj=[scores[r_id]], lb=[0], ub=[1], names=[y_r])
-            problem.variables.set_types(y_r, problem.variables.type.binary)
+            variables[y_r] = problem.addVar(name=y_r, vtype="B", obj=float(scores[r_id]))
             neg_vars.append(y_r)
         if rxn.upper_bound > 0:
             y_f = 'yf_' + r_id
-            problem.variables.add(obj=[scores[r_id]], lb=[0], ub=[1], names=[y_f])
-            problem.variables.set_types(y_f, problem.variables.type.binary)
+            variables[y_f] = problem.addVar(name=y_f, vtype="B", obj=float(scores[r_id]))
             pos_vars.append(y_f)
 
     if uptake_score != 0:
         for r_id in model.reactions:
             if r_id.id.endswith('_E'):
-                problem.variables.add(obj=[uptake_score], lb=[0], ub=[1], names=["y_"+r_id.id])
-                problem.variables.set_types("y_"+r_id.id, problem.variables.type.binary)
+                name = 'y_' + r_id.id
+                variables[name] = problem.addVar(name=name, vtype="B", obj=uptake_score)
 
     for r_id in reactions:
         y_r, y_f = 'yr_' + r_id, 'yf_' + r_id
+        flux = variables[r_id]
         if y_r in neg_vars and y_f in pos_vars:
-            problem.linear_constraints.add(lin_expr=[[[r_id, y_f, y_r], [1, -eps, bigM]]], senses=['G'], rhs=[0], names = ['lb_' + r_id])
-            problem.linear_constraints.add(lin_expr=[[[r_id, y_f, y_r], [1, -bigM, eps]]], senses=['L'], rhs=[0], names=['ub_' + r_id])
-            problem.linear_constraints.add(lin_expr=[[[y_f, y_r], [1, 1]]], senses=['L'], rhs=[1], names=['rev_' + r_id])
+            forward, reverse = variables[y_f], variables[y_r]
+            problem.addCons(flux - eps * forward + bigM * reverse >= 0, name='lb_' + r_id)
+            problem.addCons(flux - bigM * forward + eps * reverse <= 0, name='ub_' + r_id)
+            problem.addCons(forward + reverse <= 1, name='rev_' + r_id)
         elif y_f in pos_vars:
-            problem.linear_constraints.add(lin_expr=[[[r_id, y_f], [1, -eps]]], senses=['G'], rhs=[0], names=['lb_' + r_id])
-            problem.linear_constraints.add(lin_expr=[[[r_id, y_f], [1, -bigM]]], senses=['L'], rhs=[0], names=['ub_' + r_id])
+            forward = variables[y_f]
+            problem.addCons(flux - eps * forward >= 0, name='lb_' + r_id)
+            problem.addCons(flux - bigM * forward <= 0, name='ub_' + r_id)
         elif y_r in neg_vars:
-            problem.linear_constraints.add(lin_expr=[[[r_id, y_r], [1, bigM]]], senses=['G'], rhs=[0], names=['lb_' + r_id])
-            problem.linear_constraints.add(lin_expr=[[[r_id, y_r], [1, eps]]], senses=['L'], rhs=[0], names=['ub_' + r_id])
+            reverse = variables[y_r]
+            problem.addCons(flux + bigM * reverse >= 0, name='lb_' + r_id)
+            problem.addCons(flux + eps * reverse <= 0, name='ub_' + r_id)
 
     if uptake_score != 0:
         for r_id in model.reactions:
             if r_id.id.endswith('_E'):
-                problem.linear_constraints.add(lin_expr=[[[r_id.id, 'y_'+r_id.id], [1, bigM]]], senses=['G'], rhs=[0], names=['lb_' + r_id.id])
-
-    problem.objective.set_sense(problem.objective.sense.maximize)
+                problem.addCons(variables[r_id.id] + bigM * variables['y_' + r_id.id] >= 0,
+                                name='lb_' + r_id.id)
     solutions = generate_soln_pool(problem)
 
     return solutions
