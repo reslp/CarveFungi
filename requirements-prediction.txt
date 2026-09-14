@@ -1,0 +1,4 @@
+# TensorFlow CPU wheels: the ARM build is distributed as tensorflow.
+tensorflow-cpu==2.20.0; platform_system == "Linux" and platform_machine == "x86_64"
+tensorflow==2.20.0; platform_system != "Linux" or platform_machine != "x86_64"
+keras==3.11.3
